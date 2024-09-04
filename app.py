@@ -6,7 +6,7 @@ import numpy as np
 import os 
 import cv2
 import io
-
+from keybert import KeyBERT
 
 
 app = Flask(__name__)
@@ -100,6 +100,36 @@ def upload_image():
             watermarked_image = apply_invisible_watermark(image, trace_id)
             save_image_data(trace_id, description, watermarked_image)
             return jsonify({'message': f"Image processed and saved with Trace ID: {trace_id}"}), 201
+
+
+kw_model = KeyBERT()
+
+@app.route('/keywords', methods=['POST'])
+def keywords():
+    if not request.is_json:
+        return jsonify({'error': 'No JSON in request'}), 400
+    
+    data  = request.get_json()
+    description = data.get('description','')
+
+    if not description:
+        description = """Hunza, nestled in the Karakoram Range, is an e
+        nchanting valley with towering peaks, 
+        verdant fields, and the serene Hunza River."""
+
+    try: 
+        keywords_with_scores = kw_model.extract_keywords(description, top_n=5)
+        
+        # Transform to JSON format with keywords as keys and true as values
+        keywords = [keyword for keyword, score in keywords_with_scores]
+        
+        return jsonify({
+            "data": keywords,
+            "message": "Keywords successfully extracted"
+        })
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
     app.run(debug=True)
