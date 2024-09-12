@@ -1,1 +1,4 @@
 env
+.env
+local_blip_model
+model.py
