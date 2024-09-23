@@ -14,6 +14,8 @@ import requests
 import boto3
 from dotenv import load_dotenv
 import requests
+from transformers import CLIPProcessor, CLIPModel
+from io import BytesIO
 
 
 load_dotenv()
@@ -21,8 +23,13 @@ load_dotenv()
 app = Flask(__name__)
 
 
+'''Load the CLIP model and processor for NSFW detection'''
 
-model_path = "/Users/umairali/Documents/DafiLabs/Image-To-Text/local_blip_model"
+nsfw_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
+nsfw_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+
+
+model_path = "/Users/umairali/Documents/DafiLabs/CrowdGen AI/AI/local_blip_model"
 processor = BlipProcessor.from_pretrained(model_path)
 model = BlipForConditionalGeneration.from_pretrained(model_path)
 kw_model = KeyBERT()
@@ -36,6 +43,7 @@ AWS_REGION = os.getenv('AWS_REGION')
 AWS_ACCESS_URL = os.getenv('AWS_ACCESS_URL')
 
 
+
 # s3 connection
 s3_client = boto3.client(
     's3',
@@ -44,17 +52,37 @@ s3_client = boto3.client(
     region_name=AWS_REGION
 )
 
-#trace id generation
+'''Trace id generation'''
 def generate_trace_id():
     return str(uuid.uuid4())
 
-#check duplication
+'''Function to check if an image is NSFW'''
+def check_nsfw(image_bytes):
+    img = Image.open(BytesIO(image_bytes))
+    inputs = nsfw_processor(text=["NSFW", "Safe"], images=img, return_tensors="pt", padding=True)
+    with torch.no_grad():
+        outputs = nsfw_model(**inputs)
+    logits_per_image = outputs.logits_per_image
+    probs = logits_per_image.softmax(dim=1)
+    nsfw_prob = probs[0][0].item()
+    safe_prob = probs[0][1].item()
+
+    if nsfw_prob > safe_prob:
+        return "NSFW", nsfw_prob
+    else:
+        return "Safe", safe_prob
+
+
+
+
+
+'''check duplication'''
 def check_duplicate(file_bytes, trace_id):
     # Simulate the check: always return False for now (indicating no duplicate)
     # I will change this to True to simulate a duplicate
     return False
 
-#Upload to s3
+'''Upload to s3'''
 def upload_to_s3(file_bytes, trace_id):
     s3_key = f'{trace_id}.jpg'
     s3_client.put_object(
@@ -73,9 +101,11 @@ for now we are sending random url's which will be provided from nest.js API
 s3_url=  "https://d35rdqnaay08fm.cloudfront.net/6b60110c-f31b-4709-afd2-2452b9321060.jpg"
 trace_id= "6b60110c-f31b-4709-afd2-2452b9321060"
 
-#download image from s3
+
+
+'''download image from s3'''
 def download_image_from_s3(s3_url):
-    """Download image from S3 given the URL."""
+    """Download image from S3 given the URL"""
     try:
         response = requests.get(s3_url)
         if response.status_code == 200:
@@ -85,48 +115,7 @@ def download_image_from_s3(s3_url):
     except Exception as e:
         return None, str(e)
 
-
-#apply invisible water mark 
-#with showing water mark
-# def apply_invisible_watermark(image_bytes, trace_id):
-    """Apply invisible watermark with trace_id to the image."""
-    try:
-        # Open the image
-        image = Image.open(io.BytesIO(image_bytes)).convert('RGB')
-
-        # Convert to numpy array
-        image_np = np.array(image)
-        
-        # Define watermark properties
-        watermark_text = trace_id[:10]
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        font_scale = 0.5
-        color = (255, 255, 255)
-        thickness = 1
-
-        # Convert to BGR for OpenCV processing
-        image_np = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
-        text_size = cv2.getTextSize(watermark_text, font, font_scale, thickness)[0]
-        text_x = (image_np.shape[1] - text_size[0]) // 2
-        text_y = (image_np.shape[0] + text_size[1]) // 2
-        watermarked_image_np = cv2.putText(image_np, watermark_text, (text_x, text_y), font, font_scale, color, thickness)
-
-        # Convert back to RGB and PIL Image
-        watermarked_image = Image.fromarray(cv2.cvtColor(watermarked_image_np, cv2.COLOR_BGR2RGB))
-        
-        # Save to a BytesIO object to return bytes
-        buf = io.BytesIO()
-        watermarked_image.save(buf, format='JPEG')
-        buf.seek(0)  # Reset buffer position
-        return buf.getvalue(), None
-
-    except Exception as e:
-        # Log the exception
-        print(f"Exception: {e}")
-        return None, str(e)
-
-
-#Water mark image
+'''Water mark'''
 def apply_invisible_watermark(image_bytes, trace_id):
     """Apply invisible watermark with trace_id using LSB to the image."""
     try:
@@ -179,7 +168,7 @@ def apply_invisible_watermark(image_bytes, trace_id):
         print(f"Exception: {e}")
         return None, str(e)
 
-#Generate caption
+'''Generate caption'''
 def generate_caption(image_bytes):
     try:
         image = Image.open(io.BytesIO(image_bytes))
@@ -193,7 +182,7 @@ def generate_caption(image_bytes):
     except Exception as e:
         return f"Error generating caption: {str(e)}", []
 
-#extract frames from videos for the model 
+'''Extract frames from videos for the model'''
 def extract_frames_from_video(video_bytes, frame_interval=30):
     try:
         with NamedTemporaryFile(delete=False, suffix='.mp4') as temp_video_file:
@@ -227,7 +216,7 @@ def extract_frames_from_video(video_bytes, frame_interval=30):
         return []
 
 
-#3d process 3d object for model 
+'''3d process 3d object for model'''
 def process_3d_object(file_bytes):
     try:
         with NamedTemporaryFile(delete=False, suffix='.obj') as temp_3d_file:
@@ -245,7 +234,7 @@ def process_3d_object(file_bytes):
     except Exception as e:
         return {'error': str(e)}
 
-#extract frames from GIf for the model 
+"""Extract frames from GIF for the model"""
 def extract_frames_from_gif(gif_bytes, frame_interval=1):
     frames = []
     try:
@@ -260,6 +249,10 @@ def extract_frames_from_gif(gif_bytes, frame_interval=1):
     except Exception as e:
         return []
 
+
+
+
+
 """
 This API will check the duplication of image it is exist or not we are sedning request to another API (nest js)
 they will check out with (tace_id) and (s3_url) it the nest backend will respond us 
@@ -267,26 +260,53 @@ in the form of True and False
 """ 
 @app.route('/checkDuplication', methods=['POST'])
 def check_duplication():
-    file = request.files['file']
-    trace_id = generate_trace_id()
+    try:
+        file = request.files['file']
+        trace_id = generate_trace_id()
+        file_bytes = file.read()
 
-    file_bytes = file.read()
+        '''Step 1: Check if the image is NSFW'''
+        nsfw_status, prob = check_nsfw(file_bytes)
+        if nsfw_status == "NSFW":
+            return jsonify({'error': f'This content may violate our usage policies.',
+                             "Violate": True
+                            }), 403
 
-   
-    is_duplicate = False 
+        '''Step 2: Check duplication'''
+        is_duplicate = check_duplicate(file_bytes, trace_id)
+        if is_duplicate:
+            return jsonify(
+                {'error': 'File is a duplicate.',
+                 "isDuplicate": True,
+                 }       
 
-    if is_duplicate:
-        return jsonify({'error': 'File is a duplicate.'}), 409  
 
-    watermarked_image_bytes, error = apply_invisible_watermark(file_bytes, trace_id)
-    if error:
-        return jsonify({'error': f'Failed to apply watermark: {error}'}), 500
 
-    s3_url = upload_to_s3(io.BytesIO(watermarked_image_bytes), trace_id)
-    if not s3_url:
-        return jsonify({'error': 'Failed to upload to S3'}), 500
+                           
+                           ), 409  # Conflict
+        
+    
 
-    return jsonify({'trace_id': trace_id, 's3_url': s3_url}), 200
+        '''Step 3: Apply watermark'''
+        watermarked_image_bytes, error = apply_invisible_watermark(file_bytes, trace_id)
+        if error:
+            return jsonify({'error': f'Failed to apply watermark: {error}'}), 500
+
+        '''Step 4: Upload to S3 if the image is safe'''
+        s3_url = upload_to_s3(io.BytesIO(watermarked_image_bytes), trace_id)
+        if not s3_url:
+            return jsonify({'error': 'Failed to upload to S3'}), 500
+
+        return jsonify({'trace_id': trace_id, 's3_url': s3_url}), 200
+
+    except Exception as e:
+        return jsonify({'error': f'An error occurred: {str(e)}'}), 500
+
+
+
+
+
+
 
 
 
