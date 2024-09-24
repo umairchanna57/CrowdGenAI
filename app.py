@@ -16,12 +16,12 @@ from dotenv import load_dotenv
 import requests
 from transformers import CLIPProcessor, CLIPModel
 from io import BytesIO
-
+from flask_cors import CORS
 
 load_dotenv()
 
 app = Flask(__name__)
-
+CORS(app)
 
 '''Load the CLIP model and processor for NSFW detection'''
 
@@ -75,7 +75,6 @@ def check_nsfw(image_bytes):
 
 
 
-
 '''check duplication'''
 def check_duplicate(file_bytes, trace_id):
     # Simulate the check: always return False for now (indicating no duplicate)
@@ -98,8 +97,8 @@ def upload_to_s3(file_bytes, trace_id):
 """
 for now we are sending random url's which will be provided from nest.js API
 """
-s3_url=  "https://d35rdqnaay08fm.cloudfront.net/6b60110c-f31b-4709-afd2-2452b9321060.jpg"
-trace_id= "6b60110c-f31b-4709-afd2-2452b9321060"
+# s3_url=  "https://d35rdqnaay08fm.cloudfront.net/6b60110c-f31b-4709-afd2-2452b9321060.jpg"
+# trace_id= "6b60110c-f31b-4709-afd2-2452b9321060"
 
 
 
@@ -297,7 +296,7 @@ def check_duplication():
         if not s3_url:
             return jsonify({'error': 'Failed to upload to S3'}), 500
 
-        return jsonify({'trace_id': trace_id, 's3_url': s3_url}), 200
+        return jsonify({'trace_id': trace_id, 's3_url': s3_url  , "isDuplicate": False}), 200
 
     except Exception as e:
         return jsonify({'error': f'An error occurred: {str(e)}'}), 500
@@ -314,23 +313,25 @@ def check_duplication():
 @app.route('/predict', methods=['POST'])
 def predict():
     try:
-        # Using the hardcoded S3 URL and trace_id for now
-        print(f"Received trace_id: {trace_id}")  # Debug statement
-        print(f"Received s3_url: {s3_url}")  # Debug statement
-        
-        # Download the image from the S3 URL
+        data = request.get_json()
+        trace_id = data.get('trace_id')
+        s3_url = data.get('s3_url')
+        if not trace_id or not s3_url:
+            return jsonify({'error': 'trace_id and s3_url are required'}), 400
+
+        print(f"Received trace_id: {trace_id}") 
+        print(f"Received s3_url: {s3_url}") 
         image_stream, error = download_image_from_s3(s3_url)
         if error:
             return jsonify({'error': f'Failed to download image: {error}'}), 500
-        
-        # Perform prediction (generate caption and keywords)
+    
         image_bytes = image_stream.read()
         caption, keywords = generate_caption(image_bytes)
         
         if 'Error' in caption:
             return jsonify({'error': caption}), 500
         
-        return jsonify({ 'caption': caption, 'keywords': keywords , s3_url: "Image Url"}), 200
+        return jsonify({ 'caption': caption, 'keywords': keywords }), 200
 
     except Exception as e:
         return jsonify({'error': f'An error occurred: {str(e)}'}), 500
