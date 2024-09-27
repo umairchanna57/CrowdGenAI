@@ -21,7 +21,8 @@ from flask_cors import CORS
 load_dotenv()
 
 app = Flask(__name__)
-CORS(app)
+# CORS(app)
+CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)  # Allows all origins; customize as needed
 
 '''Load the CLIP model and processor for NSFW detection'''
 
@@ -304,15 +305,15 @@ def check_duplication():
                     }), 409  # Conflict
 
             else:  
-                file_extension = '.jpg' 
+                if file_extension in {'png', 'jpg', 'jpeg', 'gif'}:
 
-                '''Step 1: Check if the image is NSFW'''
-                nsfw_status, prob = check_nsfw(file_bytes)
-                if nsfw_status == "NSFW":
-                    return jsonify({
-                        'error': 'This content may violate our usage policies.',
-                        "Violate": True
-                    }), 403
+                    '''Step 1: Check if the image is NSFW'''
+                    nsfw_status, prob = check_nsfw(file_bytes)
+                    if nsfw_status == "NSFW":
+                        return jsonify({
+                            'error': 'This content may violate our usage policies.',
+                            "Violate": True
+                        }), 403
 
                 '''Step 2: Check duplication for images'''
                 is_duplicate = check_duplicate(file_bytes, trace_id)
@@ -490,6 +491,13 @@ def predict():
 
     except Exception as e:
         return jsonify({'error': f'An error occurred: {str(e)}'}), 500
+    
+
+
+@app.route('/hello', methods=['GET']) 
+def hello():
+    return "Hello, World!"
+
 
 if __name__ == '__main__':
     app.run(debug=True)
