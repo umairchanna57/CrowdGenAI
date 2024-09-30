@@ -17,6 +17,8 @@ import requests
 from transformers import CLIPProcessor, CLIPModel
 from io import BytesIO
 from flask_cors import CORS
+from werkzeug.exceptions import RequestEntityTooLarge
+import hashlib
 
 load_dotenv()
 
@@ -54,44 +56,72 @@ s3_client = boto3.client(
 )
 
 '''Trace id generation'''
-def generate_trace_id():
-    return str(uuid.uuid4())
+def generate_trace_id(file_bytes):
+    """Generate a consistent trace ID (hash) for the file content."""
+    return hashlib.sha256(file_bytes).hexdigest()
+
 
 '''Function to check if an image is NSFW'''
 def check_nsfw(image_bytes):
-    img = Image.open(BytesIO(image_bytes))
-    inputs = nsfw_processor(text=["NSFW", "Safe"], images=img, return_tensors="pt", padding=True)
-    with torch.no_grad():
-        outputs = nsfw_model(**inputs)
-    logits_per_image = outputs.logits_per_image
-    probs = logits_per_image.softmax(dim=1)
-    nsfw_prob = probs[0][0].item()
-    safe_prob = probs[0][1].item()
+    try:
+        img = Image.open(BytesIO(image_bytes)).convert("RGB")  # Ensure the image is in RGB format
+        inputs = nsfw_processor(text=["NSFW", "Safe"], images=img, return_tensors="pt", padding=True)
+        
+        with torch.no_grad():
+            outputs = nsfw_model(**inputs)
 
-    if nsfw_prob > safe_prob:
-        return "NSFW", nsfw_prob
-    else:
-        return "Safe", safe_prob
+        logits_per_image = outputs.logits_per_image
+        probs = logits_per_image.softmax(dim=1)
+        nsfw_prob = probs[0][0].item()
+        safe_prob = probs[0][1].item()
+
+        print(f"NSFW Probability: {nsfw_prob}, Safe Probability: {safe_prob}")  # Logging probabilities for debugging
+
+        if nsfw_prob > 0.85:
+            return "NSFW", nsfw_prob
+        else:
+            return "Safe", safe_prob
+
+    except Exception as e:
+        print(f"Error processing NSFW check: {e}")  # Log any errors that occur
+        return "Error", None 
 
 
 '''check duplication'''
-def check_duplicate(file_bytes, trace_id):
-    # Simulate the check: always return False for now (indicating no duplicate)
-    # I will change this to True to simulate a duplicate
-    return False
+def check_duplicate(trace_id):
+    """Check if the trace ID already exists using an external API."""
+    try:
+        # Define the URL for the external API
+        url = f'https://533e-2400-adc5-195-8700-c4c7-dbc1-39fc-2e99.ngrok-free.app/assets/check-duplication/{trace_id}'
+
+        # Make a GET request to the external API
+        response = requests.get(url, headers={'accept': '*/*'})
+
+        # Check if the request was successful
+        if response.status_code == 200:
+            # Assume the response body contains 'true' or 'false' for duplication
+            is_duplicate = response.json()  # Parse the JSON response
+            return is_duplicate  # Return the actual response (true/false)
+        else:
+            # Handle non-200 responses
+            print(f"Error: Received status code {response.status_code} from the API.")
+            return False  # Fallback to False if there is an error
+    except Exception as e:
+        # Handle exceptions such as connection errors, timeouts, etc.
+        print(f"Exception occurred while checking duplication: {str(e)}")
+        return False  # Fallback to False in case of an error
 
 '''Upload to s3'''
 def upload_to_s3(file_bytes, trace_id, file_extension, content_type):
-    s3_key = f'{trace_id}{file_extension}'  # Use the correct file extension
+    s3_key = f'{trace_id}{file_extension}'
     s3_client.put_object(
         Bucket=AWS_BUCKET,
         Key=s3_key,
         Body=file_bytes,
-        ContentType=content_type  # Set the correct MIME type
+        ContentType=content_type
     )
     s3_url = f'{AWS_ACCESS_URL}/{s3_key}'
     return s3_url
-
 
 """
 for now we are sending random url's which will be provided from nest.js API
@@ -268,7 +298,11 @@ def extract_frames_from_gif(gif_bytes, frame_interval=1):
     except Exception as e:
         return []
 
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  
 
+@app.errorhandler(RequestEntityTooLarge)
+def handle_large_file(error):
+    return jsonify({'error': 'File size exceeds the maximum limit.'}), 413  # 413 Payload Too Large
 
 
 
@@ -277,106 +311,92 @@ This API will check the duplication of image it is exist or not we are sedning r
 they will check out with (tace_id) and (s3_url) it the nest backend will respond us 
 in the form of True and False
 """ 
+
 @app.route('/checkDuplication', methods=['POST'])
 def check_duplication():
     try:
         file = request.files['file']
-        trace_id = generate_trace_id()  # Generate a unique trace ID
-        file_bytes = file.read()  # Read the file content as bytes
-        file_type = file.content_type  # Detect file type
-
-        # Default file extension and content type
-        file_extension = ''
-        content_type = file_type
-
-        # Handle images
+        file_bytes = file.read() 
+        file_type = file.content_type 
+        file_extension = os.path.splitext(file.filename)[1] 
+        print("Received content type:", file.content_type)
+        trace_id = generate_trace_id(file_bytes)
         if 'image' in file_type:
-            if 'gif' in file_type:  # Check if it's a GIF
-                file_extension = '.gif'
-                '''Step 1: Extract frames from GIF'''
-                gif_frames = extract_frames_from_gif(file_bytes)
+            nsfw_status, prob = check_nsfw(file_bytes)
+            if nsfw_status == "NSFW":
+                return jsonify({
+                    'error': 'This content may violate our usage policies.',
+                    "violate": True
+                }), 403
+            is_duplicate = check_duplicate(trace_id)
+            if is_duplicate:
+                return jsonify({
+                    'error': 'File is a duplicate.',
+                    "isDuplicate": True,
+                }), 409  
 
-                '''Step 2: Check duplication for GIF frames'''
-                is_duplicate = check_duplicate(gif_frames, trace_id)
-                if is_duplicate:
-                    return jsonify({
-                        'error': 'GIF is a duplicate.',
-                        "isDuplicate": True,
-                    }), 409  # Conflict
+        elif 'video' in file_type:  
+            nsfw_status, prob = check_nsfw(file_bytes)
+            if nsfw_status == "NSFW":
+                return jsonify({
+                    'error': 'This content may violate our usage policies.',
+                    "violate": True
+                }), 403
 
-            else:  
-                if file_extension in {'png', 'jpg', 'jpeg', 'gif'}:
-
-                    '''Step 1: Check if the image is NSFW'''
-                    nsfw_status, prob = check_nsfw(file_bytes)
-                    if nsfw_status == "NSFW":
-                        return jsonify({
-                            'error': 'This content may violate our usage policies.',
-                            "Violate": True
-                        }), 403
-
-                '''Step 2: Check duplication for images'''
-                is_duplicate = check_duplicate(file_bytes, trace_id)
-                if is_duplicate:
-                    return jsonify({
-                        'error': 'File is a duplicate.',
-                        "isDuplicate": True,
-                    }), 409  
-
-                '''Step 3: Apply watermark for images'''
-                watermarked_image_bytes, error = apply_invisible_watermark(file_bytes, trace_id)
-                if error:
-                    return jsonify({
-                        'error': f'Failed to apply watermark: {error}'
-                    }), 500
-
-                # Use watermarked bytes for the final upload
-                file_bytes = watermarked_image_bytes
-
-        # Handle videos
-        elif 'video' in file_type:
-            file_extension = '.mp4'  # Default to MP4; adjust based on MIME type if needed
-
-            '''Step 1: Extract frames from the video for comparison'''
             video_frames = extract_frames_from_video(file_bytes)
-
-            '''Step 2: Check duplication for videos using frames'''
-            is_duplicate = check_duplicate(video_frames, trace_id)
+            is_duplicate = check_duplicate(trace_id)
             if is_duplicate:
                 return jsonify({
                     'error': 'Video is a duplicate.',
                     "isDuplicate": True,
-                }), 409  # Conflict
+                }), 409 
 
-        # Handle 3D objects (e.g., .obj files)
-        elif file.filename.endswith('.obj'):
-            file_extension = '.obj'
-            content_type = 'application/octet-stream'  # MIME type for 3D objects
+        elif 'gif' in file_type: 
+            nsfw_status, prob = check_nsfw(file_bytes)
+            if nsfw_status == "NSFW":
+                return jsonify({
+                    'error': 'This content may violate our usage policies.',
+                    "violate": True
+                }), 403
 
-            '''Step 1: Process 3D object'''
+            gif_frames = extract_frames_from_gif(file_bytes)
+            if not gif_frames:
+                return jsonify({'error': 'Failed to extract frames from GIF'}), 500
+            
+            is_duplicate = check_duplicate(trace_id)
+            if is_duplicate:
+                return jsonify({
+                    'error': 'GIF is a duplicate.',
+                    "isDuplicate": True,
+                }), 409 
+
+        elif file.filename.endswith('.obj'): 
+            nsfw_status, prob = check_nsfw(file_bytes)
+            if nsfw_status == "NSFW":
+                return jsonify({
+                    'error': 'This content may violate our usage policies.',
+                    "violate": True
+                }), 403
+            
             object_info = process_3d_object(file_bytes)
-
-            '''Step 2: Check duplication for 3D objects'''
-            is_duplicate = check_duplicate(file_bytes, trace_id)
+            is_duplicate = check_duplicate(trace_id)
             if is_duplicate:
                 return jsonify({
                     'error': '3D Object is a duplicate.',
                     "isDuplicate": True,
-                }), 409  # Conflict
+                }), 409  
 
         else:
             return jsonify({
                 'error': 'Unsupported file type.'
             }), 400
 
-        '''Step 4: Upload the file to S3 with the correct extension and MIME type'''
-        s3_url = upload_to_s3(file_bytes, trace_id, file_extension, content_type)
+        s3_url = upload_to_s3(file_bytes, trace_id, file_extension, file_type)
         if not s3_url:
             return jsonify({
                 'error': 'Failed to upload to S3'
             }), 500
 
-        '''Step 5: Return success response with trace_id and S3 URL'''
         return jsonify({
             'trace_id': trace_id,
             's3_url': s3_url,
@@ -387,7 +407,6 @@ def check_duplication():
         return jsonify({
             'error': f'An error occurred: {str(e)}'
         }), 500
-
 
 
 
@@ -409,7 +428,6 @@ def determine_file_type(s3_url):
 @app.route('/predict', methods=['POST'])
 def predict():
     try:
-        # Get the S3 URL and trace_id from the request
         data = request.get_json()
         trace_id = data.get('trace_id')
         s3_url = data.get('s3_url')
@@ -422,62 +440,56 @@ def predict():
         if error:
             return jsonify({'error': f'Failed to download file from S3: {error}'}), 500
 
-        # Detect the file type by examining the file extension in the URL
         file_type = determine_file_type(s3_url)
 
         '''Step 2: Handle each file type accordingly'''
-        if 'image' in file_type:  # Handle images (JPEG, PNG)
+        if 'image' in file_type: 
             '''Generate caption for the image'''
             file_bytes = file_stream.read()
             caption, keywords = generate_caption(file_bytes)
             if 'Error' in caption:
                 return jsonify({'error': caption}), 500
-
-            # Return the response with trace_id, caption, and keywords
             return jsonify({
                 'trace_id': trace_id,
                 'caption': caption,
                 'keywords': keywords
             }), 200
 
-        elif 'gif' in file_type:  # Handle GIFs
+        elif 'gif' in file_type: 
             '''Extract frames from GIF'''
             gif_bytes = file_stream.read()
             gif_frames = extract_frames_from_gif(gif_bytes)
             if not gif_frames:
                 return jsonify({'error': 'Failed to extract frames from GIF'}), 500
             
-            # Process captions from GIF frames (assuming extract_frames_from_gif returns captions)
             gif_captions = [frame['caption'] for frame in gif_frames]
-            all_captions = ' '.join(gif_captions)  # Join captions into a single string
+            all_captions = ' '.join(gif_captions)  
             all_keywords = [kw for frame in gif_frames for kw in frame['keywords']]
 
             return jsonify({
                 'trace_id': trace_id,
-               
                 'caption': all_captions,
                 'keywords': all_keywords
             }), 200
 
-        elif 'mp4' in file_type:  # Handle .mp4 videos
+        elif 'mp4' in file_type:
             '''Extract frames from the video'''
             video_bytes = file_stream.read()
             extract_response = extract_frames_from_video(video_bytes)
             if 'error' in extract_response:
                 return jsonify({"error": extract_response['error']}), 500
 
-            # Extract captions and keywords into separate variables
             captions = ' '.join(item['caption'] for item in extract_response['frame_captions'])
             keywords = [kw for item in extract_response['frame_captions'] for kw in item['keywords']]
 
-            # Return trace_id and consolidated lists of captions and keywords
+        
             return jsonify({
                 "trace_id": trace_id,
-                "caption": captions,  # Combine all captions into a single string
-                "keywords": keywords  # Return keywords as an array
+                "caption": captions, 
+                "keywords": keywords 
             }), 200
 
-        elif 'obj' in file_type:  # Handle 3D objects
+        elif 'obj' in file_type: 
             '''Process 3D object'''
             object_bytes = file_stream.read()
             object_info = process_3d_object(object_bytes)
@@ -491,13 +503,6 @@ def predict():
 
     except Exception as e:
         return jsonify({'error': f'An error occurred: {str(e)}'}), 500
-    
-
-
-@app.route('/hello', methods=['GET']) 
-def hello():
-    return "Hello, World!"
-
 
 if __name__ == '__main__':
     app.run(debug=True)
