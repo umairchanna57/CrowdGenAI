@@ -14,23 +14,36 @@ import requests
 import boto3
 from dotenv import load_dotenv
 import requests
-from transformers import CLIPProcessor, CLIPModel
+from transformers import CLIPProcessor, CLIPModel , Speech2TextProcessor, Speech2TextForConditionalGeneration
 from io import BytesIO
 from flask_cors import CORS
 from werkzeug.exceptions import RequestEntityTooLarge
 import hashlib
+import torch
+from transformers import Speech2TextProcessor, Speech2TextForConditionalGeneration
+import librosa
+
+
+# audio_model = Speech2TextForConditionalGeneration.from_pretrained("facebook/s2t-small-librispeech-asr")
+# audio_processor = Speech2TextProcessor.from_pretrained("facebook/s2t-small-librispeech-asr")
+
+
+
+
 
 load_dotenv()
 
 app = Flask(__name__)
-# CORS(app)
-CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)  # Allows all origins; customize as needed
+CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True) 
 
-'''Load the CLIP model and processor for NSFW detection'''
 
+'''Models'''
 nsfw_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
 nsfw_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
 
+audio_model_path = "/Users/umairali/Documents/DafiLabs/CrowdGen AI/AI/audio-model"
+audio_processor = Speech2TextProcessor.from_pretrained(audio_model_path)
+audio_model = Speech2TextForConditionalGeneration.from_pretrained(audio_model_path)
 
 model_path = "/Users/umairali/Documents/DafiLabs/CrowdGen AI/AI/model"
 processor = BlipProcessor.from_pretrained(model_path)
@@ -47,7 +60,7 @@ AWS_ACCESS_URL = os.getenv('AWS_ACCESS_URL')
 
 
 
-# s3 connection
+'''s3 connection'''
 s3_client = boto3.client(
     's3',
     aws_access_key_id=AWS_ACCESS_KEY,
@@ -57,16 +70,27 @@ s3_client = boto3.client(
 
 '''Trace id generation'''
 def generate_trace_id(file_bytes):
-    """Generate a consistent trace ID (hash) for the file content."""
+    
     return hashlib.sha256(file_bytes).hexdigest()
 
+
+def transcribe_audio(audio_file_bytes):
+    """Transcribe audio to text."""
+    try:
+        audio_array, _ = librosa.load(io.BytesIO(audio_file_bytes), sr=16000)
+        inputs = audio_processor(audio_array, sampling_rate=16000, return_tensors="pt")
+        generated_ids = audio_model.generate(inputs["input_features"], attention_mask=inputs["attention_mask"])
+        transcription = audio_processor.batch_decode(generated_ids, skip_special_tokens=True)
+        return transcription[0] 
+    except Exception as e:
+        print(f"Error in audio transcription: {str(e)}")
+        return None
 
 '''Function to check if an image is NSFW'''
 def check_nsfw(image_bytes):
     try:
-        img = Image.open(BytesIO(image_bytes)).convert("RGB")  # Ensure the image is in RGB format
+        img = Image.open(BytesIO(image_bytes)).convert("RGB")  
         inputs = nsfw_processor(text=["NSFW", "Safe"], images=img, return_tensors="pt", padding=True)
-        
         with torch.no_grad():
             outputs = nsfw_model(**inputs)
 
@@ -75,41 +99,31 @@ def check_nsfw(image_bytes):
         nsfw_prob = probs[0][0].item()
         safe_prob = probs[0][1].item()
 
-        print(f"NSFW Probability: {nsfw_prob}, Safe Probability: {safe_prob}")  # Logging probabilities for debugging
+        print(f"NSFW Probability: {nsfw_prob}, Safe Probability: {safe_prob}") 
 
         if nsfw_prob > 0.85:
             return "NSFW", nsfw_prob
         else:
             return "Safe", safe_prob
-
     except Exception as e:
-        print(f"Error processing NSFW check: {e}")  # Log any errors that occur
+        print(f"Error processing NSFW check: {e}")  
         return "Error", None 
-
 
 '''check duplication'''
 def check_duplicate(trace_id):
     """Check if the trace ID already exists using an external API."""
     try:
-        # Define the URL for the external API
         url = f'https://533e-2400-adc5-195-8700-c4c7-dbc1-39fc-2e99.ngrok-free.app/assets/check-duplication/{trace_id}'
-
-        # Make a GET request to the external API
         response = requests.get(url, headers={'accept': '*/*'})
-
-        # Check if the request was successful
         if response.status_code == 200:
-            # Assume the response body contains 'true' or 'false' for duplication
-            is_duplicate = response.json()  # Parse the JSON response
-            return is_duplicate  # Return the actual response (true/false)
+            is_duplicate = response.json() 
+            return is_duplicate
         else:
-            # Handle non-200 responses
             print(f"Error: Received status code {response.status_code} from the API.")
-            return False  # Fallback to False if there is an error
+            return False  
     except Exception as e:
-        # Handle exceptions such as connection errors, timeouts, etc.
         print(f"Exception occurred while checking duplication: {str(e)}")
-        return False  # Fallback to False in case of an error
+        return False  
 
 '''Upload to s3'''
 def upload_to_s3(file_bytes, trace_id, file_extension, content_type):
@@ -123,12 +137,6 @@ def upload_to_s3(file_bytes, trace_id, file_extension, content_type):
     s3_url = f'{AWS_ACCESS_URL}/{s3_key}'
     return s3_url
 
-"""
-for now we are sending random url's which will be provided from nest.js API
-"""
-
-# s3_url= "https://d35rdqnaay08fm.cloudfront.net/03ab3ad1-3923-46f7-863f-4b7fe1e0f771.jpg"
-# trace_id = "03ab3ad1-3923-46f7-863f-4b7fe1e0f771"
 
 
 '''download image from s3'''
@@ -143,6 +151,7 @@ def download_image_from_s3(s3_url):
     except Exception as e:
         return None, str(e)
 
+
 '''Water mark'''
 def apply_invisible_watermark(image_bytes, trace_id):
     """Apply invisible watermark with trace_id using LSB to the image."""
@@ -153,7 +162,7 @@ def apply_invisible_watermark(image_bytes, trace_id):
         except Exception as e:
             return None, f"Failed to open image: {str(e)}"
         image_np = np.array(image)
-        watermark_binary = ''.join(format(ord(char), '08b') for char in trace_id[:10])  # Max 10 characters for watermark
+        watermark_binary = ''.join(format(ord(char), '08b') for char in trace_id[:10])  
         height, width, _ = image_np.shape
         if len(watermark_binary) > height * width:
             raise ValueError("Watermark is too large to fit in the image")
@@ -170,28 +179,20 @@ def apply_invisible_watermark(image_bytes, trace_id):
                     break
             if binary_index >= len(watermark_binary):
                 break
-
-
         watermarked_image = Image.fromarray(image_np)
-
-        
         buf = io.BytesIO()
         watermarked_image.save(buf, format='JPEG')
         buf.seek(0) 
         return buf.getvalue(), None
 
     except Exception as e:
-        # Log the exception
         print(f"Exception: {e}")
         return None, str(e)
-
         watermarked_image = Image.fromarray(image_np)
-
         buf = io.BytesIO()
         watermarked_image.save(buf, format='JPEG')
         buf.seek(0)  
         return buf.getvalue(), None
-
     except Exception as e:
         print(f"Exception: {e}")
         return None, str(e)
@@ -218,7 +219,7 @@ def extract_frames_from_video(video_bytes, frame_interval=30):
             temp_video_file_path = temp_video_file.name
 
         frames = []
-        results = []  # List to store captions for each frame
+        results = [] 
         video = cv2.VideoCapture(temp_video_file_path)
         frame_count = 0
 
@@ -228,37 +229,28 @@ def extract_frames_from_video(video_bytes, frame_interval=30):
                 break
 
             if frame_count % frame_interval == 0:
-                # Convert frame to RGB
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 pil_image = Image.fromarray(frame_rgb)
 
-                # Save the image to a buffer
                 buf = io.BytesIO()
                 pil_image.save(buf, format='JPEG')
                 frame_bytes = buf.getvalue()
 
-                # Generate a caption for the frame
                 caption, keywords = generate_caption(frame_bytes)
-
-                # Store the frame's caption and keywords
                 results.append({
                     'frame_count': frame_count,
                     'caption': caption,
                     'keywords': keywords
                 })
-
-                # Store the frame bytes if needed later (optional)
                 frames.append(frame_bytes)
 
             frame_count += 1
-
-        # Clean up video file
         video.release()
         os.remove(temp_video_file_path)
 
         return {
-            "frames_extracted": len(results),  # Number of frames processed
-            "frame_captions": results  # Captions and keywords for each frame
+            "frames_extracted": len(results), 
+            "frame_captions": results 
         }
     except Exception as e:
         return {"error": str(e)}
@@ -302,7 +294,7 @@ app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
 
 @app.errorhandler(RequestEntityTooLarge)
 def handle_large_file(error):
-    return jsonify({'error': 'File size exceeds the maximum limit.'}), 413  # 413 Payload Too Large
+    return jsonify({'error': 'File size exceeds the maximum limit.'}), 413  
 
 
 
@@ -311,7 +303,6 @@ This API will check the duplication of image it is exist or not we are sedning r
 they will check out with (tace_id) and (s3_url) it the nest backend will respond us 
 in the form of True and False
 """ 
-
 @app.route('/checkDuplication', methods=['POST'])
 def check_duplication():
     try:
@@ -385,7 +376,22 @@ def check_duplication():
                     'error': '3D Object is a duplicate.',
                     "isDuplicate": True,
                 }), 409  
+        elif 'audio' in file_type:
+            nsfw_status, prob = check_nsfw(file_bytes) 
+            if nsfw_status == "NSFW":
+                return jsonify({
+                    'error': 'This content may violate our usage policies.',
+                    "violate": True
+                }), 403
+            s3_url = upload_to_s3(file_bytes, trace_id, file_extension, file_type)
+            if not s3_url:
+                return jsonify({'error': 'Failed to upload to S3'}), 500
 
+            return jsonify({
+                'trace_id': trace_id,
+                's3_url': s3_url,
+                "isDuplicate": False
+            }), 200
         else:
             return jsonify({
                 'error': 'Unsupported file type.'
@@ -407,6 +413,7 @@ def check_duplication():
         return jsonify({
             'error': f'An error occurred: {str(e)}'
         }), 500
+    
 
 
 
@@ -419,6 +426,8 @@ def determine_file_type(s3_url):
         return 'mp4'
     elif s3_url.endswith('.obj'):
         return 'obj'
+    elif s3_url.endswith('.wav') or s3_url.endswith('.mp3') or s3_url.endswith('M4A') or s3_url.endswith('DSD') or s3_url.endswith('FLAC') or s3_url.endswith('OGG'):
+        return 'audio'
     else:
         return 'unknown'
 
@@ -435,14 +444,11 @@ def predict():
         if not trace_id or not s3_url:
             return jsonify({'error': 'trace_id and s3_url are required'}), 400
 
-        '''Step 1: Download the file from S3'''
         file_stream, error = download_image_from_s3(s3_url)
         if error:
             return jsonify({'error': f'Failed to download file from S3: {error}'}), 500
 
         file_type = determine_file_type(s3_url)
-
-        '''Step 2: Handle each file type accordingly'''
         if 'image' in file_type: 
             '''Generate caption for the image'''
             file_bytes = file_stream.read()
@@ -456,7 +462,6 @@ def predict():
             }), 200
 
         elif 'gif' in file_type: 
-            '''Extract frames from GIF'''
             gif_bytes = file_stream.read()
             gif_frames = extract_frames_from_gif(gif_bytes)
             if not gif_frames:
@@ -498,9 +503,24 @@ def predict():
 
             return jsonify({'trace_id': trace_id, '3D_object_info': object_info}), 200
 
+
+        elif 'audio' in file_type:
+            audio_bytes = file_stream.read()
+            transcription = transcribe_audio(audio_bytes)
+            if transcription is None:
+                return jsonify({'error': 'Error during transcription'}), 500
+
+            keywords = kw_model.extract_keywords(transcription, top_n=5)
+            keyword_list = [kw[0] for kw in keywords]  
+            return jsonify({
+                'trace_id': trace_id,
+                'caption': transcription,
+                'keywords': keyword_list,  
+                'isDuplicate': False
+            }), 200
+
         else:
             return jsonify({'error': 'Unsupported file type'}), 400
-
     except Exception as e:
         return jsonify({'error': f'An error occurred: {str(e)}'}), 500
 
