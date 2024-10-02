@@ -22,7 +22,8 @@ import hashlib
 import torch
 from transformers import Speech2TextProcessor, Speech2TextForConditionalGeneration
 import librosa
-
+from PyPDF2 import PdfReader
+# from docx import Document
 
 # audio_model = Speech2TextForConditionalGeneration.from_pretrained("facebook/s2t-small-librispeech-asr")
 # audio_processor = Speech2TextProcessor.from_pretrained("facebook/s2t-small-librispeech-asr")
@@ -298,6 +299,55 @@ def handle_large_file(error):
 
 
 
+
+
+
+
+'''This is only for pdf to keyword not here we used any AI model here is used Keyberd library'''
+def extract_keywords_from_pdf(pdf_bytes):
+    """Extract keywords from a PDF file using KeyBERT."""
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        text = ''
+        for page in reader.pages:
+            text += page.extract_text() + '\n'  
+        keywords = kw_model.extract_keywords(text, top_n=5)
+        return [kw[0] for kw in keywords] 
+    except Exception as e:
+        print(f"Error extracting keywords from PDF: {str(e)}")
+        return []
+
+
+'''This function for txt any text file'''
+def extract_keywords_from_txt(txt_bytes):
+    """Extract keywords from a TXT file using KeyBERT."""
+    try:
+        text = txt_bytes.decode('utf-8')
+
+        keywords = kw_model.extract_keywords(text, top_n=5)
+        return [kw[0] for kw in keywords]
+    except Exception as e:
+        print(f"Error extracting keywords from TXT: {str(e)}")
+        return []
+
+
+
+'''this is for word docx file'''
+def extract_keywords_from_docx(docx_bytes):
+    """Extract keywords from a DOCX file using KeyBERT."""
+    try:
+        doc = Document(io.BytesIO(docx_bytes)) 
+        text = ''
+        for paragraph in doc.paragraphs:
+            text += paragraph.text + '\n' 
+
+        keywords = kw_model.extract_keywords(text, top_n=5)  
+        return [kw[0] for kw in keywords]
+    except Exception as e:
+        print(f"Error extracting keywords from DOCX: {str(e)}")
+        return []
+
+
 """
 This API will check the duplication of image it is exist or not we are sedning request to another API (nest js)
 they will check out with (tace_id) and (s3_url) it the nest backend will respond us 
@@ -392,6 +442,16 @@ def check_duplication():
                 's3_url': s3_url,
                 "isDuplicate": False
             }), 200
+        
+
+
+        elif file.filename.endswith('.pdf') or file.filename.endswith('.docx') or file.filename.endswith('.txt'):
+            s3_url = upload_to_s3(file_bytes, trace_id, file_extension, file_type)
+            if not s3_url:
+                return jsonify({'error': 'Failed to upload to S3'}), 500
+
+            return jsonify({'trace_id': trace_id, 's3_url': s3_url, "isDuplicate": False}), 200
+        
         else:
             return jsonify({
                 'error': 'Unsupported file type.'
@@ -408,6 +468,7 @@ def check_duplication():
             's3_url': s3_url,
             "isDuplicate": False
         }), 200
+      
 
     except Exception as e:
         return jsonify({
@@ -427,9 +488,12 @@ def determine_file_type(s3_url):
     elif s3_url.endswith('.obj'):
         return 'obj'
     elif s3_url.endswith('.wav') or s3_url.endswith('.mp3') or s3_url.endswith('M4A') or s3_url.endswith('DSD') or s3_url.endswith('FLAC') or s3_url.endswith('OGG'):
-        return 'audio'
+        return 'audio' 
+    elif s3_url.endswith('.pdf') or s3_url.endswith('.docx') or s3_url.endswith('.txt'):
+        return 'pdf'
     else:
         return 'unknown'
+
 
 
 
@@ -518,7 +582,32 @@ def predict():
                 'keywords': keyword_list,  
                 'isDuplicate': False
             }), 200
+        
 
+        elif 'pdf' in file_type:
+            pdf_bytes = file_stream.read()
+            keywords = extract_keywords_from_pdf(pdf_bytes)
+            return jsonify({
+                'trace_id': trace_id,
+                'keywords': keywords,
+            }), 200
+        
+        elif file_type == 'docx':
+            docx_bytes = file_stream.read()
+            keywords = extract_keywords_from_docx(docx_bytes)
+            return jsonify({
+                'trace_id': trace_id,
+                'keywords': keywords,
+            }), 200
+        
+        elif file_type == 'txt':
+            txt_bytes = file_stream.read()
+            keywords = extract_keywords_from_txt(txt_bytes)
+            return jsonify({
+                'trace_id': trace_id,
+                'keywords': keywords,
+            }), 200
+        
         else:
             return jsonify({'error': 'Unsupported file type'}), 400
     except Exception as e:
