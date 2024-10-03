@@ -22,11 +22,16 @@ import hashlib
 import torch
 from transformers import Speech2TextProcessor, Speech2TextForConditionalGeneration
 import librosa
+from docx import Document
+from transformers import GPT2LMHeadModel, GPT2Tokenizer
+import logging
 from PyPDF2 import PdfReader
-# from docx import Document
+
 
 # audio_model = Speech2TextForConditionalGeneration.from_pretrained("facebook/s2t-small-librispeech-asr")
 # audio_processor = Speech2TextProcessor.from_pretrained("facebook/s2t-small-librispeech-asr")
+
+
 
 
 
@@ -36,6 +41,8 @@ load_dotenv()
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True) 
+
+
 
 
 '''Models'''
@@ -73,7 +80,6 @@ s3_client = boto3.client(
 def generate_trace_id(file_bytes):
     
     return hashlib.sha256(file_bytes).hexdigest()
-
 
 def transcribe_audio(audio_file_bytes):
     """Transcribe audio to text."""
@@ -138,8 +144,6 @@ def upload_to_s3(file_bytes, trace_id, file_extension, content_type):
     s3_url = f'{AWS_ACCESS_URL}/{s3_key}'
     return s3_url
 
-
-
 '''download image from s3'''
 def download_image_from_s3(s3_url):
     """Download image from S3 given the URL"""
@@ -151,7 +155,6 @@ def download_image_from_s3(s3_url):
             return None, f"Failed to download image from S3, status code: {response.status_code}"
     except Exception as e:
         return None, str(e)
-
 
 '''Water mark'''
 def apply_invisible_watermark(image_bytes, trace_id):
@@ -304,18 +307,58 @@ def handle_large_file(error):
 
 
 '''This is only for pdf to keyword not here we used any AI model here is used Keyberd library'''
+def extract_caption_from_text(text, char_limit=300):
+    """Extract a caption from the given text. Returns the first paragraph or first N characters."""
+    # Split the text into paragraphs (assuming newlines separate paragraphs)
+    paragraphs = [p.strip() for p in text.split('\n') if p.strip()]
+    
+    if paragraphs:
+        # Return the first paragraph if it's long enough, or the first N characters
+        first_paragraph = paragraphs[0]
+        return first_paragraph if len(first_paragraph) <= char_limit else first_paragraph[:char_limit] + "..."
+    
+    # Fallback if no suitable paragraph is found
+    return text[:char_limit] + "..." if text else ""
+
+
+
+def extract_caption_from_text(text, char_limit=300):
+    """Extract the first paragraph or first N characters from text as a caption."""
+    paragraphs = [p.strip() for p in text.split('\n') if p.strip()]
+    if paragraphs:
+        first_paragraph = paragraphs[0]
+        return first_paragraph if len(first_paragraph) <= char_limit else first_paragraph[:char_limit] + "..."
+    return text[:char_limit] + "..." if text else ""
+
+
 def extract_keywords_from_pdf(pdf_bytes):
-    """Extract keywords from a PDF file using KeyBERT."""
+    """Extract both a caption and keywords from a PDF file using KeyBERT."""
     try:
+        # Read the PDF from bytes
         reader = PdfReader(io.BytesIO(pdf_bytes))
         text = ''
+        
+        # Extract text from each page
         for page in reader.pages:
-            text += page.extract_text() + '\n'  
+            text += page.extract_text() + '\n'  # Append extracted text with line breaks
+        
+        if not text.strip():  # Check if any text was extracted
+            logging.warning("No text found in the PDF.")
+            return {"caption": "", "keywords": []}
+
+        # Extract top 5 keywords using KeyBERT
         keywords = kw_model.extract_keywords(text, top_n=5)
-        return [kw[0] for kw in keywords] 
+        extracted_keywords = [kw[0] for kw in keywords]
+        
+        # Extract the caption (e.g., first paragraph or first N characters)
+        caption = extract_caption_from_text(text, char_limit=300)
+        
+        # Return the caption and keywords as a dictionary
+        return {"caption": caption, "keywords": extracted_keywords}
+    
     except Exception as e:
-        print(f"Error extracting keywords from PDF: {str(e)}")
-        return []
+        logging.error(f"Error extracting keywords from PDF: {str(e)}")
+        return {"caption": "", "keywords": []}
 
 
 '''This function for txt any text file'''
@@ -477,7 +520,6 @@ def check_duplication():
     
 
 
-
 def determine_file_type(s3_url):
     if s3_url.endswith('.jpg') or s3_url.endswith('.jpeg') or s3_url.endswith('.png'):
         return 'image'
@@ -583,14 +625,17 @@ def predict():
                 'isDuplicate': False
             }), 200
         
-
         elif 'pdf' in file_type:
+            '''Extract keywords and caption from PDF file'''
             pdf_bytes = file_stream.read()
-            keywords = extract_keywords_from_pdf(pdf_bytes)
+            result = extract_keywords_from_pdf(pdf_bytes)  
+
             return jsonify({
                 'trace_id': trace_id,
-                'keywords': keywords,
+                'caption': result['caption'],
+                'keywords': result['keywords']
             }), 200
+    
         
         elif file_type == 'docx':
             docx_bytes = file_stream.read()
@@ -612,6 +657,68 @@ def predict():
             return jsonify({'error': 'Unsupported file type'}), 400
     except Exception as e:
         return jsonify({'error': f'An error occurred: {str(e)}'}), 500
+
+
+
+# Function to load GPT-2 model and tokenizer on demand
+def load_gpt2_model():
+    tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
+    model = GPT2LMHeadModel.from_pretrained('gpt2')
+    model.to(device)  # Move model to the appropriate device (CPU or GPU)
+    return tokenizer, model
+
+# Function to generate text description
+def generate_description(prompt, max_length, tokenizer, model):
+    # Encode the input prompt
+    input_ids = tokenizer.encode(prompt, return_tensors='pt').to(device)  # Move input to the device
+    
+    # Generate text
+    with torch.no_grad():
+        output = model.generate(
+            input_ids,
+            max_length=max_length,
+            num_return_sequences=1,
+            no_repeat_ngram_size=2,
+            do_sample=True,
+            top_k=50,
+            top_p=0.95,
+            temperature=0.7
+        )
+    
+    # Decode the generated text
+    generated_text = tokenizer.decode(output[0], skip_special_tokens=True)
+    return generated_text
+
+# API route for text generation
+@app.route('/textgeneration', methods=['POST'])
+def text_generation():
+    data = request.json
+    prompt = data.get('prompt', '')
+    max_length = data.get('max_length', 100)
+
+    if not prompt:
+        return jsonify({'error': 'Prompt is required.'}), 400
+
+    if not isinstance(max_length, int) or max_length <= 0:
+        return jsonify({'error': 'max_length must be a positive integer.'}), 400
+
+    try:
+        # Load GPT-2 model and tokenizer on demand
+        tokenizer, model = load_gpt2_model()
+
+        # Generate text using the GPT-2 model
+        generated_text = generate_description(prompt, max_length, tokenizer, model)
+
+        # Offload the model from GPU if used
+        model.to('cpu')
+        torch.cuda.empty_cache()  # Clear GPU cache
+
+        return jsonify({'generated_text': generated_text})
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 
 if __name__ == '__main__':
     app.run(debug=True)
