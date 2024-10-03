@@ -41,5 +41,7 @@ tqdm==4.66.5
 transformers @ git+https://github.com/huggingface/transformers@78b2929c0554b79e0489b451ce4ece14d265ead2
 trimesh==4.4.9
 typing_extensions==4.12.2
+pypdf==5.0.1
+
 
 
